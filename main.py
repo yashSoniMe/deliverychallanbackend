@@ -41,7 +41,7 @@ MONGO_URI = os.getenv(
 
 # SMTP Config - Pull directly from Environment Variables
 SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
+SMTP_PORT = 465
 SMTP_EMAIL = os.getenv("SMTP_EMAIL")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
