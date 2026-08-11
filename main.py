@@ -12,7 +12,16 @@ from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict
 from motor.motor_asyncio import AsyncIOMotorClient
 from fastapi.middleware.cors import CORSMiddleware
+import socket
 
+# Force Python's socket library to resolve IPv4 addresses only
+orig_getaddrinfo = socket.getaddrinfo
+
+def ipv4_only_getaddrinfo(*args, **kwargs):
+    responses = orig_getaddrinfo(*args, **kwargs)
+    return [res for res in responses if res[0] == socket.AF_INET]
+
+socket.getaddrinfo = ipv4_only_getaddrinfo
 # ------------------------------------------------------------------------------
 # LOGGING
 # ------------------------------------------------------------------------------
