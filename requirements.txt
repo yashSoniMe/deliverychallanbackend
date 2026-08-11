@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+motor
+gspread
+google-auth
+pydantic
+python-dotenv
