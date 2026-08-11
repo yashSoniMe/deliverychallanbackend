@@ -3,6 +3,6 @@ uvicorn[standard]
 motor
 gspread
 google-auth
-pydantic
+pydantic[email]
 python-dotenv
 email_validator
