@@ -18,7 +18,7 @@ logger = logging.getLogger("voucher-manager")
 # ------------------------------------------------------------------------------
 # 1. APP INITIALIZATION & CORS
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Voucher Manager Backend", version="2.8.0")
+app = FastAPI(title="Voucher Manager Backend", version="2.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -88,6 +88,30 @@ def send_email_otp(target_email: str, otp: str):
         raise HTTPException(
             status_code=500, detail="Failed to dispatch OTP via email service."
         )
+
+
+def convert_sheet_url_to_pdf_url(sheet_url: str) -> str:
+    """
+    Converts a Google Sheet edit URL into a direct PDF download link
+    formatted specifically for mobile devices (A4 portrait, fit-to-width).
+    """
+    if "/d/" in sheet_url and "/edit" in sheet_url:
+        spreadsheet_id = sheet_url.split("/d/")[1].split("/edit")[0]
+        
+        pdf_export_url = (
+            f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?"
+            f"format=pdf"
+            f"&portrait=true"        # Orientation: portrait
+            f"&size=A4"             # Page size: A4
+            f"&fitw=true"           # Fit to width
+            f"&gridlines=false"     # Hide gridlines
+            f"&printtitle=false"    # Hide document title header
+            f"&sheetnames=false"    # Hide tab names
+            f"&fzr=false"           # Do not repeat frozen rows
+        )
+        return pdf_export_url
+    
+    return sheet_url
 
 
 async def get_next_dc_no(user_email: str) -> str:
@@ -441,13 +465,17 @@ async def generate_voucher_document(req: VoucherRequest):
         req, sender_details, beneficiary_doc, dc_no, sheet_file_name
     )
 
+    pdf_url = convert_sheet_url_to_pdf_url(sheet_url)
+
     await vouchers_col.update_one(
-        {"_id": result.inserted_id}, {"$set": {"generated_sheet_url": sheet_url}}
+        {"_id": result.inserted_id},
+        {"$set": {"generated_sheet_url": sheet_url, "pdf_url": pdf_url}},
     )
 
     return {
         "message": "Voucher generated successfully",
         "dc_no": dc_no,
         "sheet_url": sheet_url,
+        "pdf_url": pdf_url,
         "record_id": str(result.inserted_id),
     }
