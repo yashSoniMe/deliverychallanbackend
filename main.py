@@ -97,7 +97,7 @@ def convert_sheet_url_to_pdf_url(sheet_url: str) -> str:
     """
     if "/d/" in sheet_url and "/edit" in sheet_url:
         spreadsheet_id = sheet_url.split("/d/")[1].split("/edit")[0]
-        
+
         pdf_export_url = (
             f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?"
             f"format=pdf"
@@ -110,7 +110,7 @@ def convert_sheet_url_to_pdf_url(sheet_url: str) -> str:
             f"&fzr=false"           # Do not repeat frozen rows
         )
         return pdf_export_url
-    
+
     return sheet_url
 
 
@@ -371,7 +371,49 @@ async def add_item(item: Item, user_email: Optional[str] = Query(None)):
 
 
 # ------------------------------------------------------------------------------
-# 8. GOOGLE SHEET GENERATION LOGIC
+# 8. VOUCHER LIST ENDPOINT (USER ISOLATED)  <-- NEW
+# ------------------------------------------------------------------------------
+@app.get("/api/vouchers", response_model=List[dict])
+async def get_vouchers(user_email: Optional[str] = Query(None)):
+    """Returns all previously generated vouchers for a given user, most
+    recent first. Powers the 'All Vouchers' list screen in the app."""
+    query = {}
+    if user_email:
+        query["user_email"] = user_email.lower().strip()
+
+    vouchers = []
+    cursor = vouchers_col.find(query).sort("created_at", -1)
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        if isinstance(doc.get("created_at"), datetime):
+            doc["created_at"] = doc["created_at"].isoformat()
+        vouchers.append(doc)
+    return vouchers
+
+
+@app.get("/api/vouchers/{voucher_id}")
+async def get_voucher_by_id(voucher_id: str):
+    """Returns a single voucher record by its Mongo _id."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    try:
+        obj_id = ObjectId(voucher_id)
+    except InvalidId:
+        raise HTTPException(status_code=400, detail="Invalid voucher id")
+
+    doc = await vouchers_col.find_one({"_id": obj_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Voucher not found")
+
+    doc["_id"] = str(doc["_id"])
+    if isinstance(doc.get("created_at"), datetime):
+        doc["created_at"] = doc["created_at"].isoformat()
+    return doc
+
+
+# ------------------------------------------------------------------------------
+# 9. GOOGLE SHEET GENERATION LOGIC
 # ------------------------------------------------------------------------------
 def duplicate_and_populate_sheet(
     req: VoucherRequest,
