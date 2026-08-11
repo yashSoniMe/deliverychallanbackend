@@ -1,27 +1,14 @@
 import os
 import random
 import logging
-import smtplib
-import traceback
 import requests
 from datetime import datetime, timezone, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict
 from motor.motor_asyncio import AsyncIOMotorClient
 from fastapi.middleware.cors import CORSMiddleware
-import socket
 
-# Force Python's socket library to resolve IPv4 addresses only
-orig_getaddrinfo = socket.getaddrinfo
-
-def ipv4_only_getaddrinfo(*args, **kwargs):
-    responses = orig_getaddrinfo(*args, **kwargs)
-    return [res for res in responses if res[0] == socket.AF_INET]
-
-socket.getaddrinfo = ipv4_only_getaddrinfo
 # ------------------------------------------------------------------------------
 # LOGGING
 # ------------------------------------------------------------------------------
@@ -44,19 +31,9 @@ app.add_middleware(
 # ------------------------------------------------------------------------------
 # 2. ENVIRONMENT & DATABASE SETUP
 # ------------------------------------------------------------------------------
-MONGO_URI = os.getenv(
-    "MONGO_URI",
-)
+MONGO_URI = os.getenv("MONGO_URI")
 
-# SMTP Config - Pull directly from Environment Variables
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 465
-SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-
-APPS_SCRIPT_URL = os.getenv(
-    "APPS_SCRIPT_URL",
-)
+APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL")
 APPS_SCRIPT_SECRET = os.getenv("APPS_SCRIPT_SECRET")
 
 DC_NO_PREFIX = "DC-"
@@ -75,61 +52,42 @@ otp_store: Dict[str, dict] = {}
 
 
 # ------------------------------------------------------------------------------
-# 3. DIRECT SMTP EMAIL DISPATCH & HELPERS
+# 3. HELPER FUNCTIONS & APPS SCRIPT DISPATCH
 # ------------------------------------------------------------------------------
 def send_email_otp(target_email: str, otp: str):
-    # ... setup MIME message ...
-    
-    try:
-        logger.info(f"Connecting to SMTP server {SMTP_SERVER}:{SMTP_PORT}...")
-        
-        if SMTP_PORT == 465:
-            # SSL connection
-            server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=12)
-        else:
-            # TLS connection
-            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=12)
-            server.starttls()
+    """Dispatches OTP email via Google Apps Script web app endpoint."""
+    if not APPS_SCRIPT_URL or not APPS_SCRIPT_SECRET:
+        logger.error("APPS_SCRIPT_URL or APPS_SCRIPT_SECRET is missing.")
+        raise HTTPException(
+            status_code=500, detail="Server configuration error for email service."
+        )
 
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.sendmail(SMTP_EMAIL, target_email, msg.as_string())
-        server.quit()
-        logger.info(f"Successfully delivered OTP email to {target_email}")
-
-    except Exception as e:
-        logger.error(f"Failed to dispatch OTP email: {e}")
-        raise HTTPException(status_code=500, detail=f"Email dispatch failed: {str(e)}")
-
-    msg = MIMEMultipart()
-    msg['From'] = f"DAMS <{SMTP_EMAIL}>"
-    msg['To'] = target_email
-    msg['Subject'] = f"{otp} is your DeliveryChallan App Verification Code"
-
-    body = (
-        f"Hello,\n\n"
-        f"Your verification OTP is: {otp}\n\n"
-        f"This code will expire in 1 minute.\n"
-        f"Don't Share this code with anyone."
-    )
-    msg.attach(MIMEText(body, 'plain'))
+    payload = {
+        "secret": APPS_SCRIPT_SECRET,
+        "action": "send_otp",
+        "target_email": target_email,
+        "otp": otp,
+    }
 
     try:
-        logger.info(f"Connecting to SMTP server {SMTP_SERVER}:{SMTP_PORT}...")
-        
-        if SMTP_PORT == 465:
-            server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=12)
-        else:
-            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=12)
-            server.starttls()
+        logger.info(f"Dispatching OTP to Apps Script endpoint for {target_email}...")
+        response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=12)
+        response.raise_for_status()
 
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.sendmail(SMTP_EMAIL, target_email, msg.as_string())
-        server.quit()
-        logger.info(f"Successfully delivered OTP email to {target_email}")
+        res_data = response.json()
+        if res_data.get("error"):
+            logger.error(f"Apps Script error during OTP dispatch: {res_data['error']}")
+            raise HTTPException(
+                status_code=500, detail="Apps Script authorization or execution failed."
+            )
 
-    except Exception as e:
-        logger.error(f"Failed to dispatch OTP email: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Email dispatch failed: {str(e)}")
+        logger.info(f"Successfully delivered OTP to {target_email} via Google Apps Script.")
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to communicate with Apps Script HTTP service: {e}")
+        raise HTTPException(
+            status_code=500, detail="Failed to dispatch OTP via email service."
+        )
 
 
 async def get_next_dc_no(user_email: str) -> str:
@@ -233,10 +191,10 @@ async def verify_otp(data: VerifyOTPRequest):
         {"email": email},
         {
             "$set": {"email": email, "last_login": datetime.now(timezone.utc)},
-            "$setOnInsert": {"created_at": datetime.now(timezone.utc)}
+            "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
         },
         upsert=True,
-        return_document=True
+        return_document=True,
     )
 
     is_registered = bool(user_doc.get("company_name"))
@@ -245,14 +203,18 @@ async def verify_otp(data: VerifyOTPRequest):
         "user_id": str(user_doc["_id"]),
         "email": email,
         "is_registered": is_registered,
-        "user_data": {
-            "company_name": user_doc.get("company_name", ""),
-            "address_line_1": user_doc.get("address_line_1", ""),
-            "address_line_2": user_doc.get("address_line_2", ""),
-            "gstin": user_doc.get("gstin", ""),
-            "pan_no": user_doc.get("pan_no", ""),
-            "mobile_no": user_doc.get("mobile_no", "")
-        } if is_registered else None
+        "user_data": (
+            {
+                "company_name": user_doc.get("company_name", ""),
+                "address_line_1": user_doc.get("address_line_1", ""),
+                "address_line_2": user_doc.get("address_line_2", ""),
+                "gstin": user_doc.get("gstin", ""),
+                "pan_no": user_doc.get("pan_no", ""),
+                "mobile_no": user_doc.get("mobile_no", ""),
+            }
+            if is_registered
+            else None
+        ),
     }
 
 
@@ -270,7 +232,7 @@ async def get_user_profile(email: EmailStr = Query(...)):
         "address_line_2": user_doc.get("address_line_2", ""),
         "gstin": user_doc.get("gstin", ""),
         "pan_no": user_doc.get("pan_no", ""),
-        "mobile_no": user_doc.get("mobile_no", "")
+        "mobile_no": user_doc.get("mobile_no", ""),
     }
 
 
@@ -284,7 +246,7 @@ async def update_user_profile(data: UpdateUserProfileRequest):
         "address_line_2": data.address_line_2.strip(),
         "gstin": data.gstin.strip().upper(),
         "mobile_no": data.mobile_no.strip(),
-        "updated_at": datetime.now(timezone.utc)
+        "updated_at": datetime.now(timezone.utc),
     }
 
     result = await users_col.update_one({"email": email_clean}, {"$set": update_payload})
@@ -306,21 +268,21 @@ async def register_user(data: RegisterUserRequest):
         "gstin": data.gstin.strip().upper(),
         "pan_no": data.pan_no.strip().upper(),
         "mobile_no": data.mobile_no.strip(),
-        "updated_at": datetime.now(timezone.utc)
+        "updated_at": datetime.now(timezone.utc),
     }
 
     result = await users_col.find_one_and_update(
         {"email": email},
         {"$set": update_payload},
         upsert=True,
-        return_document=True
+        return_document=True,
     )
 
     return {
         "message": "User company details registered successfully.",
         "user_id": str(result["_id"]),
         "email": email,
-        "is_registered": True
+        "is_registered": True,
     }
 
 
@@ -343,8 +305,7 @@ async def get_beneficiaries(user_email: Optional[str] = Query(None)):
 
 @app.post("/api/beneficiaries/add", status_code=201)
 async def add_beneficiary(
-    beneficiary: Beneficiary, 
-    user_email: Optional[str] = Query(None)
+    beneficiary: Beneficiary, user_email: Optional[str] = Query(None)
 ):
     data = beneficiary.model_dump()
     target_email = user_email or data.get("user_email")
@@ -374,10 +335,7 @@ async def get_items(user_email: Optional[str] = Query(None)):
 
 
 @app.post("/api/items/add", status_code=201)
-async def add_item(
-    item: Item, 
-    user_email: Optional[str] = Query(None)
-):
+async def add_item(item: Item, user_email: Optional[str] = Query(None)):
     data = item.model_dump()
     target_email = user_email or data.get("user_email")
 
@@ -402,8 +360,7 @@ def duplicate_and_populate_sheet(
         raise ValueError("APPS_SCRIPT_URL / APPS_SCRIPT_SECRET env vars are not set.")
 
     items_payload = [
-        {"sr_no": i + 1, **item.model_dump()}
-        for i, item in enumerate(req.items)
+        {"sr_no": i + 1, **item.model_dump()} for i, item in enumerate(req.items)
     ]
 
     full_address = sender_details.get("address_line_1", "")
@@ -433,7 +390,9 @@ def duplicate_and_populate_sheet(
     data = resp.json()
 
     if "error" in data:
-        raise HTTPException(status_code=500, detail=f"Apps Script error: {data['error']}")
+        raise HTTPException(
+            status_code=500, detail=f"Apps Script error: {data['error']}"
+        )
 
     return data["sheet_url"]
 
@@ -444,32 +403,31 @@ async def generate_voucher_document(req: VoucherRequest):
     user_doc = await users_col.find_one({"email": email_clean})
 
     if not user_doc:
-        raise HTTPException(status_code=404, detail="User not found. Please register first.")
+        raise HTTPException(
+            status_code=404, detail="User not found. Please register first."
+        )
 
     sender_details = {
         "company_name": user_doc.get("company_name", ""),
         "address_line_1": user_doc.get("address_line_1", ""),
         "address_line_2": user_doc.get("address_line_2", ""),
         "gstin": user_doc.get("gstin", ""),
-        "mobile_no": user_doc.get("mobile_no", "")
+        "mobile_no": user_doc.get("mobile_no", ""),
     }
 
-    beneficiary_doc = await beneficiaries_col.find_one({
-        "name": req.beneficiary_name,
-        "user_email": email_clean
-    })
-    
-    # Fallback search without user_email if specific match isn't found
+    beneficiary_doc = await beneficiaries_col.find_one(
+        {"name": req.beneficiary_name, "user_email": email_clean}
+    )
+
     if not beneficiary_doc:
-        beneficiary_doc = await beneficiaries_col.find_one({"name": req.beneficiary_name})
+        beneficiary_doc = await beneficiaries_col.find_one(
+            {"name": req.beneficiary_name}
+        )
 
     if beneficiary_doc:
         beneficiary_doc.pop("_id", None)
 
-    # 1. Fetch user-isolated DC Number (e.g. DC-0001 per user)
     dc_no = await get_next_dc_no(email_clean)
-
-    # 2. Derive user prefix for distinguishing Excel/Google Sheet copies (e.g. 'john_DC-0001')
     user_handle = email_clean.split("@")[0]
     sheet_file_name = f"{user_handle}_{dc_no}"
 
@@ -480,21 +438,16 @@ async def generate_voucher_document(req: VoucherRequest):
     result = await vouchers_col.insert_one(record_data)
 
     sheet_url = duplicate_and_populate_sheet(
-        req, 
-        sender_details, 
-        beneficiary_doc, 
-        dc_no, 
-        sheet_file_name
+        req, sender_details, beneficiary_doc, dc_no, sheet_file_name
     )
 
     await vouchers_col.update_one(
-        {"_id": result.inserted_id},
-        {"$set": {"generated_sheet_url": sheet_url}}
+        {"_id": result.inserted_id}, {"$set": {"generated_sheet_url": sheet_url}}
     )
 
     return {
         "message": "Voucher generated successfully",
         "dc_no": dc_no,
         "sheet_url": sheet_url,
-        "record_id": str(result.inserted_id)
+        "record_id": str(result.inserted_id),
     }
