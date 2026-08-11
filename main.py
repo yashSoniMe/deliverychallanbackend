@@ -69,12 +69,27 @@ otp_store: Dict[str, dict] = {}
 # 3. DIRECT SMTP EMAIL DISPATCH & HELPERS
 # ------------------------------------------------------------------------------
 def send_email_otp(target_email: str, otp: str):
-    if not SMTP_EMAIL or not SMTP_PASSWORD:
-        logger.error("SMTP credentials missing!")
-        raise HTTPException(
-            status_code=500,
-            detail="Server email setup missing."
-        )
+    # ... setup MIME message ...
+    
+    try:
+        logger.info(f"Connecting to SMTP server {SMTP_SERVER}:{SMTP_PORT}...")
+        
+        if SMTP_PORT == 465:
+            # SSL connection
+            server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=12)
+        else:
+            # TLS connection
+            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=12)
+            server.starttls()
+
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.sendmail(SMTP_EMAIL, target_email, msg.as_string())
+        server.quit()
+        logger.info(f"Successfully delivered OTP email to {target_email}")
+
+    except Exception as e:
+        logger.error(f"Failed to dispatch OTP email: {e}")
+        raise HTTPException(status_code=500, detail=f"Email dispatch failed: {str(e)}")
 
     msg = MIMEMultipart()
     msg['From'] = f"DAMS <{SMTP_EMAIL}>"
