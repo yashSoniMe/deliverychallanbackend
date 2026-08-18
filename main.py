@@ -194,6 +194,19 @@ class VoucherRequest(BaseModel):
     note: str = Field(default="", example="for repair and polish")
 
 
+class VoucherUpdateRequest(BaseModel):
+    """Payload for editing an existing voucher in place. Deliberately
+    excludes user_email/dc_no - those stay fixed to the original voucher
+    so an edit always refreshes the SAME voucher rather than creating a
+    new one."""
+    beneficiary_name: str
+    recipient_email: str
+    items: List[VoucherItemInput]
+    approx_value: float
+    mode_of_transport: str = Field(default="", example="By Courier")
+    note: str = Field(default="", example="for repair and polish")
+
+
 # ------------------------------------------------------------------------------
 # 5. AUTHENTICATION & USER PROFILE ENDPOINTS
 # ------------------------------------------------------------------------------
@@ -453,7 +466,7 @@ async def delete_item(item_id: str):
 
 
 # ------------------------------------------------------------------------------
-# 8. VOUCHER LIST ENDPOINT (USER ISOLATED)  <-- NEW
+# 8. VOUCHER LIST / EDIT / DELETE ENDPOINTS (USER ISOLATED)
 # ------------------------------------------------------------------------------
 @app.get("/api/vouchers", response_model=List[dict])
 async def get_vouchers(user_email: Optional[str] = Query(None)):
@@ -488,6 +501,102 @@ async def get_voucher_by_id(voucher_id: str):
     return doc
 
 
+@app.put("/api/vouchers/{voucher_id}")
+async def update_voucher(voucher_id: str, req: VoucherUpdateRequest):
+    """Edits an existing voucher IN PLACE: keeps the same DC No. and Mongo
+    record, re-populates the same generated sheet with the new values, and
+    refreshes the stored pdf_url - instead of creating a brand new voucher.
+    This is what powers the in-app 'Edit' action (replacing the old flow of
+    opening the Google Sheet directly to make changes)."""
+    obj_id = parse_object_id(voucher_id, "voucher")
+
+    existing = await vouchers_col.find_one({"_id": obj_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Voucher not found")
+
+    email_clean = (existing.get("user_email") or "").lower().strip()
+    user_doc = await users_col.find_one({"email": email_clean})
+    if not user_doc:
+        raise HTTPException(
+            status_code=404, detail="User not found for this voucher."
+        )
+
+    sender_details = {
+        "company_name": user_doc.get("company_name", ""),
+        "address_line_1": user_doc.get("address_line_1", ""),
+        "address_line_2": user_doc.get("address_line_2", ""),
+        "gstin": user_doc.get("gstin", ""),
+        "mobile_no": user_doc.get("mobile_no", ""),
+    }
+
+    beneficiary_doc = await beneficiaries_col.find_one(
+        {"name": req.beneficiary_name, "user_email": email_clean}
+    )
+    if not beneficiary_doc:
+        beneficiary_doc = await beneficiaries_col.find_one(
+            {"name": req.beneficiary_name}
+        )
+    if beneficiary_doc:
+        beneficiary_doc.pop("_id", None)
+
+    # Keep the ORIGINAL dc_no/file name so the same voucher is refreshed
+    # rather than a new one being generated alongside it.
+    dc_no = existing.get("dc_no") or await get_next_dc_no(email_clean)
+    user_handle = email_clean.split("@")[0] if email_clean else "voucher"
+    sheet_file_name = f"{user_handle}_{dc_no}"
+
+    full_req = VoucherRequest(
+        user_email=email_clean,
+        beneficiary_name=req.beneficiary_name,
+        recipient_email=req.recipient_email,
+        items=req.items,
+        approx_value=req.approx_value,
+        mode_of_transport=req.mode_of_transport,
+        note=req.note,
+    )
+
+    sheet_url = duplicate_and_populate_sheet(
+        full_req,
+        sender_details,
+        beneficiary_doc,
+        dc_no,
+        sheet_file_name,
+        is_update=True,
+        existing_sheet_url=existing.get("generated_sheet_url", ""),
+    )
+    pdf_url = convert_sheet_url_to_pdf_url(sheet_url)
+
+    update_payload = full_req.model_dump()
+    update_payload["dc_no"] = dc_no
+    update_payload["updated_at"] = datetime.now(timezone.utc)
+    update_payload["generated_sheet_url"] = sheet_url
+    update_payload["pdf_url"] = pdf_url
+
+    await vouchers_col.update_one({"_id": obj_id}, {"$set": update_payload})
+
+    return {
+        "message": "Voucher updated successfully",
+        "dc_no": dc_no,
+        "sheet_url": sheet_url,
+        "pdf_url": pdf_url,
+        "record_id": str(obj_id),
+    }
+
+
+@app.delete("/api/vouchers/{voucher_id}")
+async def delete_voucher(voucher_id: str):
+    """Deletes a voucher record permanently. Powers the in-app 'Delete'
+    action on a voucher."""
+    obj_id = parse_object_id(voucher_id, "voucher")
+
+    result = await vouchers_col.delete_one({"_id": obj_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Voucher not found")
+
+    return {"message": "Voucher deleted successfully"}
+
+
 # ------------------------------------------------------------------------------
 # 9. GOOGLE SHEET GENERATION LOGIC
 # ------------------------------------------------------------------------------
@@ -497,6 +606,8 @@ def duplicate_and_populate_sheet(
     beneficiary_details: Optional[dict],
     dc_no: str,
     sheet_file_name: str,
+    is_update: bool = False,
+    existing_sheet_url: str = "",
 ) -> str:
     if not APPS_SCRIPT_URL or not APPS_SCRIPT_SECRET:
         raise ValueError("APPS_SCRIPT_URL / APPS_SCRIPT_SECRET env vars are not set.")
@@ -511,6 +622,12 @@ def duplicate_and_populate_sheet(
 
     payload = {
         "secret": APPS_SCRIPT_SECRET,
+        # NOTE: the paired Google Apps Script needs a handler for the
+        # "update_voucher" action that looks up `existing_sheet_url` and
+        # edits that same spreadsheet in place, instead of duplicating a
+        # new file the way the default/"generate_voucher" action does.
+        "action": "update_voucher" if is_update else "generate_voucher",
+        "existing_sheet_url": existing_sheet_url,
         "dc_no": dc_no,
         "dc_date": datetime.now().strftime("%d/%m/%Y"),
         "sheet_file_name": sheet_file_name,
