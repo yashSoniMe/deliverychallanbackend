@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict
 from motor.motor_asyncio import AsyncIOMotorClient
 from fastapi.middleware.cors import CORSMiddleware
+from bson import ObjectId
+from bson.errors import InvalidId
 
 # ------------------------------------------------------------------------------
 # LOGGING
@@ -124,6 +126,14 @@ async def get_next_dc_no(user_email: str) -> str:
     )
     seq = doc["seq"]
     return f"{DC_NO_PREFIX}{seq:0{DC_NO_WIDTH}d}"
+
+
+def parse_object_id(raw_id: str, label: str) -> ObjectId:
+    """Safely parses a Mongo ObjectId, raising a clean 400 error otherwise."""
+    try:
+        return ObjectId(raw_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=400, detail=f"Invalid {label} id")
 
 
 # ------------------------------------------------------------------------------
@@ -341,6 +351,44 @@ async def add_beneficiary(
     return {"message": "Beneficiary saved", "id": str(result.inserted_id)}
 
 
+@app.put("/api/beneficiaries/{beneficiary_id}")
+async def update_beneficiary(beneficiary_id: str, beneficiary: Beneficiary):
+    """Updates an existing beneficiary's details in place."""
+    obj_id = parse_object_id(beneficiary_id, "beneficiary")
+
+    update_payload = {
+        "name": beneficiary.name.strip(),
+        "address": beneficiary.address.strip(),
+        "state_code": beneficiary.state_code.strip(),
+        "gstin": beneficiary.gstin.strip().upper(),
+        "pan_no": beneficiary.pan_no.strip().upper(),
+    }
+    if beneficiary.user_email:
+        update_payload["user_email"] = beneficiary.user_email.lower().strip()
+
+    result = await beneficiaries_col.update_one(
+        {"_id": obj_id}, {"$set": update_payload}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Beneficiary not found")
+
+    return {"message": "Beneficiary updated successfully"}
+
+
+@app.delete("/api/beneficiaries/{beneficiary_id}")
+async def delete_beneficiary(beneficiary_id: str):
+    """Deletes a beneficiary permanently."""
+    obj_id = parse_object_id(beneficiary_id, "beneficiary")
+
+    result = await beneficiaries_col.delete_one({"_id": obj_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Beneficiary not found")
+
+    return {"message": "Beneficiary deleted successfully"}
+
+
 # ------------------------------------------------------------------------------
 # 7. ITEM ENDPOINTS (USER ISOLATED)
 # ------------------------------------------------------------------------------
@@ -370,6 +418,40 @@ async def add_item(item: Item, user_email: Optional[str] = Query(None)):
     return {"message": "Item added successfully", "id": str(result.inserted_id)}
 
 
+@app.put("/api/items/{item_id}")
+async def update_item(item_id: str, item: Item):
+    """Updates an existing item's details in place."""
+    obj_id = parse_object_id(item_id, "item")
+
+    update_payload = {
+        "description": item.description.strip(),
+        "hsn_code": item.hsn_code.strip(),
+        "purity": item.purity.strip(),
+    }
+    if item.user_email:
+        update_payload["user_email"] = item.user_email.lower().strip()
+
+    result = await items_col.update_one({"_id": obj_id}, {"$set": update_payload})
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    return {"message": "Item updated successfully"}
+
+
+@app.delete("/api/items/{item_id}")
+async def delete_item(item_id: str):
+    """Deletes an item permanently."""
+    obj_id = parse_object_id(item_id, "item")
+
+    result = await items_col.delete_one({"_id": obj_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    return {"message": "Item deleted successfully"}
+
+
 # ------------------------------------------------------------------------------
 # 8. VOUCHER LIST ENDPOINT (USER ISOLATED)  <-- NEW
 # ------------------------------------------------------------------------------
@@ -394,13 +476,7 @@ async def get_vouchers(user_email: Optional[str] = Query(None)):
 @app.get("/api/vouchers/{voucher_id}")
 async def get_voucher_by_id(voucher_id: str):
     """Returns a single voucher record by its Mongo _id."""
-    from bson import ObjectId
-    from bson.errors import InvalidId
-
-    try:
-        obj_id = ObjectId(voucher_id)
-    except InvalidId:
-        raise HTTPException(status_code=400, detail="Invalid voucher id")
+    obj_id = parse_object_id(voucher_id, "voucher")
 
     doc = await vouchers_col.find_one({"_id": obj_id})
     if not doc:
