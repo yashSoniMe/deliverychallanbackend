@@ -192,6 +192,13 @@ class VoucherRequest(BaseModel):
     approx_value: float
     mode_of_transport: str = Field(default="", example="By Courier")
     note: str = Field(default="", example="for repair and polish")
+    # "Place of Supply" beneficiary. The Flutter app always resolves and
+    # sends the final name here (whether mirrored from beneficiary_name or
+    # picked independently) — same_as_receiver is stored alongside it purely
+    # so the app can restore the checkbox state when a voucher is reopened
+    # for editing.
+    delivery_beneficiary_name: str = Field(default="", example="Shree Hari Jewellers")
+    same_as_receiver: bool = Field(default=True)
 
 
 class VoucherUpdateRequest(BaseModel):
@@ -205,6 +212,8 @@ class VoucherUpdateRequest(BaseModel):
     approx_value: float
     mode_of_transport: str = Field(default="", example="By Courier")
     note: str = Field(default="", example="for repair and polish")
+    delivery_beneficiary_name: str = Field(default="", example="Shree Hari Jewellers")
+    same_as_receiver: bool = Field(default=True)
 
 
 # ------------------------------------------------------------------------------
@@ -539,6 +548,19 @@ async def update_voucher(voucher_id: str, req: VoucherUpdateRequest):
     if beneficiary_doc:
         beneficiary_doc.pop("_id", None)
 
+    # "Place of Supply" beneficiary — same lookup pattern as above, scoped
+    # to the user first and falling back to a global name match.
+    delivery_name = req.delivery_beneficiary_name.strip() or req.beneficiary_name
+    delivery_beneficiary_doc = await beneficiaries_col.find_one(
+        {"name": delivery_name, "user_email": email_clean}
+    )
+    if not delivery_beneficiary_doc:
+        delivery_beneficiary_doc = await beneficiaries_col.find_one(
+            {"name": delivery_name}
+        )
+    if delivery_beneficiary_doc:
+        delivery_beneficiary_doc.pop("_id", None)
+
     # Keep the ORIGINAL dc_no/file name so the same voucher is refreshed
     # rather than a new one being generated alongside it.
     dc_no = existing.get("dc_no") or await get_next_dc_no(email_clean)
@@ -553,6 +575,8 @@ async def update_voucher(voucher_id: str, req: VoucherUpdateRequest):
         approx_value=req.approx_value,
         mode_of_transport=req.mode_of_transport,
         note=req.note,
+        delivery_beneficiary_name=req.delivery_beneficiary_name,
+        same_as_receiver=req.same_as_receiver,
     )
 
     sheet_url = duplicate_and_populate_sheet(
@@ -561,6 +585,7 @@ async def update_voucher(voucher_id: str, req: VoucherUpdateRequest):
         beneficiary_doc,
         dc_no,
         sheet_file_name,
+        delivery_beneficiary_details=delivery_beneficiary_doc,
         is_update=True,
         existing_sheet_url=existing.get("generated_sheet_url", ""),
     )
@@ -606,6 +631,7 @@ def duplicate_and_populate_sheet(
     beneficiary_details: Optional[dict],
     dc_no: str,
     sheet_file_name: str,
+    delivery_beneficiary_details: Optional[dict] = None,
     is_update: bool = False,
     existing_sheet_url: str = "",
 ) -> str:
@@ -619,6 +645,10 @@ def duplicate_and_populate_sheet(
     full_address = sender_details.get("address_line_1", "")
     if sender_details.get("address_line_2"):
         full_address += f", {sender_details.get('address_line_2')}"
+
+    # "Place of Supply" name always falls back to the receiver's name so an
+    # older client that never sends delivery_beneficiary_name still works.
+    delivery_beneficiary_name = req.delivery_beneficiary_name.strip() or req.beneficiary_name
 
     payload = {
         "secret": APPS_SCRIPT_SECRET,
@@ -641,6 +671,11 @@ def duplicate_and_populate_sheet(
         "mode_of_transport": req.mode_of_transport,
         "note": req.note,
         "beneficiary_details": beneficiary_details,
+        # "Place of Supply" / delivery-location beneficiary. May be the
+        # same beneficiary as above (when same_as_receiver was checked) or
+        # a different one entirely.
+        "delivery_beneficiary_name": delivery_beneficiary_name,
+        "delivery_beneficiary_details": delivery_beneficiary_details,
         "items": items_payload,
     }
 
@@ -686,6 +721,19 @@ async def generate_voucher_document(req: VoucherRequest):
     if beneficiary_doc:
         beneficiary_doc.pop("_id", None)
 
+    # "Place of Supply" beneficiary — same lookup pattern as above, scoped
+    # to the user first and falling back to a global name match.
+    delivery_name = req.delivery_beneficiary_name.strip() or req.beneficiary_name
+    delivery_beneficiary_doc = await beneficiaries_col.find_one(
+        {"name": delivery_name, "user_email": email_clean}
+    )
+    if not delivery_beneficiary_doc:
+        delivery_beneficiary_doc = await beneficiaries_col.find_one(
+            {"name": delivery_name}
+        )
+    if delivery_beneficiary_doc:
+        delivery_beneficiary_doc.pop("_id", None)
+
     dc_no = await get_next_dc_no(email_clean)
     user_handle = email_clean.split("@")[0]
     sheet_file_name = f"{user_handle}_{dc_no}"
@@ -697,7 +745,12 @@ async def generate_voucher_document(req: VoucherRequest):
     result = await vouchers_col.insert_one(record_data)
 
     sheet_url = duplicate_and_populate_sheet(
-        req, sender_details, beneficiary_doc, dc_no, sheet_file_name
+        req,
+        sender_details,
+        beneficiary_doc,
+        dc_no,
+        sheet_file_name,
+        delivery_beneficiary_details=delivery_beneficiary_doc,
     )
 
     pdf_url = convert_sheet_url_to_pdf_url(sheet_url)
